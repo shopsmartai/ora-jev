@@ -19,6 +19,8 @@ SELECT ora_jev.jev_choice(JSON_OBJECT(*), 'which team should handle this?',
 
 Each row is judged by [TypeSafe's Jev](https://docs.typesafe.ai), a "System One" model that returns calibrated
 probabilities instead of text, or by any server that speaks the same `POST /v1/systemone` API.
+Rows are sent in batches of 20 per request, the size pg-jev measured as accurate.
+
 It's the Oracle counterpart of [pg-jev](https://github.com/realZachi/pg-jev) for PostgreSQL, with the same function names.
 
 ## Functions
@@ -32,7 +34,9 @@ It's the Oracle counterpart of [pg-jev](https://github.com/realZachi/pg-jev) for
 | `jev_score_norm(row, question, levels_json)` | NUMBER | The same, 0..1 |
 | `jev_confidence(row, question, kind, options_json)` | NUMBER | Confidence of a `choice` / `score` answer |
 | `jev_eval(row, question, kind, options_json)` | VARCHAR2 (JSON) | The raw answer |
-| `jev_stats()` | VARCHAR2 (JSON) | Rows, cache hits, requests, ms, input tokens, estimated cost for this session |
+| `jev_table(cursor, question [, kind, options_json])` | rows (`id, value, prob, confidence, answer`) | **Batched**: judge every row a cursor returns, `batch_size` rows per request |
+| `warm(query, question [, kind, options_json])` | NUMBER (rows judged) | **Batched** pre-scoring: caches answers so later `jev()`/`jev_prob()` calls on those rows are free |
+| `jev_stats()` | VARCHAR2 (JSON) | Rows, cache hits, requests, rows sent, ms, input tokens, estimated cost for this session |
 | `jev_cache_clear()`, `jev_version()` | | |
 | `set_option(key, value)` | | Session settings, below |
 
@@ -51,7 +55,8 @@ Session level with `ora_jev.set_option(key, value)`; defaults in table `ORA_JEV_
 | `threshold` | `0.5` | Cut-off for `jev()` |
 | `timeout` | `30` | Seconds per request |
 | `wallet` | none | `UTL_HTTP` wallet path for https, e.g. `file:/opt/oracle/wallet` |
-| `max_rows_per_session` | `0` (off) | Spend guard: refuse new API calls after this many in the session |
+| `max_rows_per_session` | `0` (off) | Spend guard: refuse calls that would send more than this many rows in the session |
+| `batch_size` | `20` | Rows per request for `jev_table` and `warm` (1–100). pg-jev measured accuracy dropping above ~20–25 |
 
 ## Install
 
@@ -84,14 +89,39 @@ python3 test/mock_jev.py 8788
 ```
 ```sql
 SQL> DEFINE mock_url = 'http://<host-reachable-from-the-db>:8788/v1/systemone'
-SQL> @test/test_mock.sql      -- 12 checks
+SQL> @test/test_mock.sql      -- 18 checks, including batching
 ```
 The schema needs a network ACL for the mock's host and port.
 
+## Batching: three ways to call it
+
+```sql
+-- 1. Row by row: simplest; one request per new row.
+SELECT * FROM tickets WHERE ora_jev.jev(JSON_OBJECT(*), 'the customer is angry') = 1;
+
+-- 2. Set-based: 20 rows per request. The cursor returns (id, row JSON).
+SELECT t.*, r.prob
+  FROM TABLE(ora_jev.jev_table(CURSOR(SELECT id, JSON_OBJECT(*) FROM tickets), 'the customer is angry')) r
+  JOIN tickets t ON t.id = r.id
+ WHERE r.value = '1';
+
+SELECT r.value AS team, COUNT(*)
+  FROM TABLE(ora_jev.jev_table(CURSOR(SELECT id, JSON_OBJECT(*) FROM tickets),
+                               'which team should handle this?', 'choice', '["billing","technical","sales"]')) r
+ GROUP BY r.value;
+
+-- 3. Warm, then query normally: 20 rows per request up front, then every jev() call is a cache hit.
+SELECT ora_jev.warm('SELECT JSON_OBJECT(*) FROM tickets', 'the customer is angry') FROM dual;
+SELECT * FROM tickets WHERE ora_jev.jev(JSON_OBJECT(*), 'the customer is angry') = 1;
+```
+
+In the test suite, 45 rows take 3 requests with `jev_table` or `warm`, against 45 row by row.
+`warm` and the later `jev()` call must send identical row JSON (same `JSON_OBJECT(...)` expression) to share the cache.
+
 ## How it works
 
-Each call sends one row in the same request shape pg-jev uses:
-`{"model": ..., "state": {"condition": ..., "rows": [row]}, "questions": {"r0": {...}}}`.
+Requests use the shape pg-jev uses: `{"model": ..., "state": {"condition": ..., "rows": [...]},
+"questions": {"r0": {...}, "r1": {...}, ...}}`, one question per row, all answered in one call.
 Answers are cached for the session by endpoint, model, question, options and row content, so re-running a query,
 changing the threshold or sorting by `jev_prob` costs nothing extra.
 
@@ -99,8 +129,9 @@ changing the threshold or sorting by `jev_prob` costs nothing extra.
 
 - **Row data leaves the database** for the configured endpoint. Don't send data you may not share.
   Send only the columns needed, or point `api_url` at a server inside your network.
-- **One request per row.** There's no read-ahead batching yet (pg-jev packs 20 rows per request). Filter with
-  ordinary SQL first; `FETCH FIRST n ROWS` limits calls.
+- Plain `jev()` in a `WHERE` clause is still one request per new row (Oracle has no read-ahead hook for it).
+  Use `jev_table` or `warm` for whole tables, and filter with ordinary SQL first.
+- Requests run one after another (`UTL_HTTP` is synchronous); batching cuts their number, not their latency.
 - Functions are not deterministic, so they can't be used in indexes or virtual columns.
 - `estimated_cost_usd` uses Jev 1.13's list price ($0.042 per million input tokens) whatever the endpoint.
 
